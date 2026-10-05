@@ -1,7 +1,11 @@
-# Home Assistant Community — draft post
+# Home Assistant Community — draft / status
 
 **Category:** Share your Projects!  
 **Title:** Duratech Dura-H17i pool heat pump BLE bridge for Home Assistant (ESPHome)
+
+**Status (2026-10-05):** GitHub published. Forum post for this project is **blocked** because account `gomblouse-arch` is silenced (“New user typed too fast”) until a moderator lifts it. The earlier Link Mini topic is still **pending approval**.
+
+Draft body below — paste once the account can post again:
 
 ---
 
