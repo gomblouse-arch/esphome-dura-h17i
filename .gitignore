@@ -1,0 +1,31 @@
+# Secrets — never commit
+esphome/secrets.yaml
+**/secrets.yaml
+
+# Private restore backup (WiFi/API keys + real MAC)
+backup-mijn-esp/
+
+# Personal / local-only notes
+ha-health-check-*.md
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# BLE captures (large; keep locally)
+captures/*.pcapng
+captures/*.pcap
+captures/*.btsnoop
+
+# Local deploy artifacts
+esphome/_*
+esphome/upload_*
+tools/_*

@@ -1,0 +1,1108 @@
+# Dura-H17i BLE bridge voor Home Assistant
+# Reverse-engineered MQTT-over-BLE protocol (DURACLOUD)
+
+substitutions:
+  device_name: dura-h17i
+  friendly_name: Dura-H17i
+  # MAC van jouw warmtepomp — zet heatpump_mac in secrets.yaml
+  heatpump_mac: !secret heatpump_mac
+  svc_cmd: "682B3401-2EF9-4BB9-AD9B-28E228D41C1F"
+  chr_write: "682B3402-2EF9-4BB9-AD9B-28E228D41C1F"
+  chr_notify: "682B3403-2EF9-4BB9-AD9B-28E228D41C1F"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  includes:
+    - dura_parser.h
+  on_boot:
+    priority: -100
+    then:
+      - delay: 8s
+      - if:
+          condition:
+            switch.is_on: ble_bridge_enabled
+          then:
+            - script.execute: ble_connect_cycle
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Geen power-save; iets lager WiFi-TX helpt BLE op dezelfde antenne
+  power_save_mode: none
+  output_power: 8.5dB
+  ap:
+    ssid: "${device_name}-setup"
+    password: !secret ota_password
+
+captive_portal:
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+logger:
+  level: INFO
+  logs:
+    # Minder spam: geen “Found characteristic” per write
+    esp32_ble_client: INFO
+    ble_client: INFO
+    esp32_ble_tracker: WARN
+    dura_h17i: INFO
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: false
+    interval: 320ms
+    window: 30ms
+
+ble_client:
+  - mac_address: ${heatpump_mac}
+    id: dura_ble
+    auto_connect: false
+    on_connect:
+      then:
+        - lambda: |-
+            id(handshake_sent) = false;
+            id(state_subscribed) = false;
+        - script.execute: ble_handshake_burst
+    on_disconnect:
+      then:
+        - script.stop: ble_handshake_burst
+        - script.stop: ble_subscribe_state
+        - script.stop: ble_refresh_telemetry
+        - lambda: |-
+            id(ble_connected).publish_state(false);
+            id(handshake_sent) = false;
+            id(state_subscribed) = false;
+            id(last_notify_ms) = 0;
+            id(last_telemetry_ms) = 0;
+        # Niet te agressief: pomp heeft hersteltijd nodig (voorkomt 0x3e/133-storm)
+        - delay: 45s
+        - if:
+            condition:
+              and:
+                - switch.is_on: ble_bridge_enabled
+                - binary_sensor.is_off: ble_connected
+            then:
+              - script.execute: ble_connect_cycle
+
+globals:
+  - id: pending_setpoint
+    type: float
+    restore_value: no
+    initial_value: "28.0"
+  - id: pending_interval_min
+    type: int
+    restore_value: no
+    initial_value: "70"
+  - id: pending_check_min
+    type: int
+    restore_value: no
+    initial_value: "5"
+  - id: pending_onetouch_brightness
+    type: int
+    restore_value: no
+    initial_value: "4"
+  - id: handshake_sent
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: state_subscribed
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  # millis() van laatste BLE-notify — voor stale-verbinding detectie
+  - id: last_notify_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  # Laatste notify mét inlaat of vermogen (heartbeats zonder telemetry tellen niet)
+  - id: last_telemetry_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  # Voorkomt reconnect-storm via watchdog
+  - id: last_watchdog_reconnect_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: last_telemetry_refresh_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+script:
+  # App (sniffer): wacht MTU → CONNECT×2 → SUBSCRIBE 042202080100
+  # → dashboard-notify; later 052202080100 (ambient/uitlaat) + 052202080200 (state).
+  # Pomp stuurt daarna ~1 Hz 78 B heartbeats (geen app-keepalive-writes).
+  - id: ble_handshake_burst
+    mode: restart
+    then:
+      - logger.log:
+          level: INFO
+          format: "Dura-H17i: handshake (wacht MTU, CONNECT×2 + SUB×2)"
+      # MTU + notify-registratie afronden vóór writes (voorkomt write-spam)
+      - delay: 700ms
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: [0x02, 0x0A, 0x01, 0x00]
+      - delay: 350ms
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: [0x02, 0x0A, 0x01, 0x00]
+      - delay: 250ms
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: [0x04, 0x22, 0x02, 0x08, 0x01, 0x00]
+      - delay: 250ms
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: [0x04, 0x22, 0x02, 0x08, 0x01, 0x00]
+      - delay: 1200ms
+      - if:
+          condition:
+            lambda: 'return !id(handshake_sent);'
+          then:
+            - logger.log:
+                level: WARN
+                format: "Dura-H17i: geen dashboard-notify — 1× retry"
+            - ble_client.ble_write:
+                id: dura_ble
+                service_uuid: ${svc_cmd}
+                characteristic_uuid: ${chr_write}
+                value: [0x02, 0x0A, 0x01, 0x00]
+            - delay: 300ms
+            - ble_client.ble_write:
+                id: dura_ble
+                service_uuid: ${svc_cmd}
+                characteristic_uuid: ${chr_write}
+                value: [0x04, 0x22, 0x02, 0x08, 0x01, 0x00]
+
+  # Detail: ambient + uitlaat (080100), daarna state/modus (080200)
+  - id: ble_subscribe_state
+    mode: single
+    then:
+      - delay: 200ms
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: [0x05, 0x22, 0x02, 0x08, 0x01, 0x00]
+      - delay: 500ms
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: [0x05, 0x22, 0x02, 0x08, 0x02, 0x00]
+      - lambda: |-
+          id(state_subscribed) = true;
+      - logger.log:
+          level: INFO
+          format: "Dura-H17i: detail-subscribe (080100 ambient/uitlaat + 080200 state)"
+
+  # Vraag opnieuw dashboard + detail op (heartbeats houden BLE open zonder verse W/°C)
+  - id: ble_refresh_telemetry
+    mode: single
+    then:
+      - logger.log:
+          level: INFO
+          format: "Dura-H17i: telemetry-refresh (dashboard + detail subscribe)"
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: [0x04, 0x22, 0x02, 0x08, 0x01, 0x00]
+      - delay: 400ms
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: [0x05, 0x22, 0x02, 0x08, 0x01, 0x00]
+      - delay: 400ms
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: [0x05, 0x22, 0x02, 0x08, 0x02, 0x00]
+      - lambda: |-
+          id(last_telemetry_refresh_ms) = millis();
+
+  - id: ble_connect_cycle
+    mode: single
+    then:
+      - if:
+          condition:
+            switch.is_on: ble_bridge_enabled
+          then:
+            - esp32_ble_tracker.stop_scan:
+            - delay: 1s
+            - ble_client.disconnect: dura_ble
+            - delay: 3s
+            - ble_client.connect: dura_ble
+
+  - id: write_select_settings_group3
+    then:
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: [0x05, 0x22, 0x02, 0x08, 0x03, 0x00]
+      - delay: 150ms
+
+  - id: write_power_on
+    then:
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: [0x04, 0x1A, 0x08, 0x08, 0x07, 0x10, 0x05, 0x1A, 0x02, 0x08, 0x01, 0x00]
+
+  - id: write_power_off
+    then:
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: [0x04, 0x1A, 0x08, 0x08, 0x06, 0x10, 0x05, 0x1A, 0x02, 0x08, 0x01, 0x00]
+
+  - id: write_mode_standaard
+    then:
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: [0x04, 0x1A, 0x08, 0x08, 0x07, 0x10, 0x06, 0x1A, 0x02, 0x28, 0x01, 0x00]
+
+  - id: write_mode_boost
+    then:
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: [0x04, 0x1A, 0x08, 0x08, 0x07, 0x10, 0x06, 0x1A, 0x02, 0x28, 0x02, 0x00]
+
+  - id: write_mode_slim
+    then:
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: [0x04, 0x1A, 0x08, 0x08, 0x07, 0x10, 0x06, 0x1A, 0x02, 0x28, 0x03, 0x00]
+
+  - id: write_mode_stille
+    then:
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: [0x04, 0x1A, 0x08, 0x08, 0x06, 0x10, 0x06, 0x1A, 0x02, 0x28, 0x01, 0x00]
+
+  - id: write_setpoint
+    then:
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: !lambda |-
+            return dura::make_setpoint_command(id(pending_setpoint));
+
+  # Settings group 3 (id=1 UnitMode). sniffer8 wire evidence:
+  #   Koelen 20:31 → enum1 0b…2801 then setpoint (15°C)
+  #   Auto     20:32 → enum2 …2802
+  #   Verwarmen 20:33 → enum1 0a…2801 (often twice), no immediate setpoint
+  # Schema names Heating=0/Cooling=1 invert vs early labels; enum0 writes are ignored.
+  - id: write_unit_verwarmen
+    then:
+      - logger.log:
+          level: INFO
+          format: "Dura-H17i BLE WRITE Unit Verwarmen hex=0a1a08080310011a02280100 ble=%s"
+          args: ['id(ble_connected).state ? "connected" : "DISCONNECTED"']
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: [0x0A, 0x1A, 0x08, 0x08, 0x03, 0x10, 0x01, 0x1A, 0x02, 0x28, 0x01, 0x00]
+      - delay: 200ms
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: [0x0A, 0x1A, 0x08, 0x08, 0x03, 0x10, 0x01, 0x1A, 0x02, 0x28, 0x01, 0x00]
+
+  - id: write_unit_koelen
+    then:
+      - lambda: |-
+          if (id(setpoint_temperature).has_state()) {
+            id(pending_setpoint) = id(setpoint_temperature).state;
+          }
+      - logger.log:
+          level: INFO
+          format: "Dura-H17i BLE WRITE Unit Koelen enum1+setpoint hex=0b1a08080310011a02280100 ble=%s"
+          args: ['id(ble_connected).state ? "connected" : "DISCONNECTED"']
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: [0x0B, 0x1A, 0x08, 0x08, 0x03, 0x10, 0x01, 0x1A, 0x02, 0x28, 0x01, 0x00]
+      - delay: 300ms
+      - script.execute: write_setpoint
+
+  - id: write_unit_auto
+    then:
+      - logger.log:
+          level: INFO
+          format: "Dura-H17i BLE WRITE Unit Automatisch hex=0b1a08080310011a02280200 ble=%s"
+          args: ['id(ble_connected).state ? "connected" : "DISCONNECTED"']
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: [0x0B, 0x1A, 0x08, 0x08, 0x03, 0x10, 0x01, 0x1A, 0x02, 0x28, 0x02, 0x00]
+
+  # Settings group 3 (id=2 PoolType). sniffer8/10: pool toggle via enum1 …2801; notify 2801=Spa, 2819=Zwembad.
+  # sniffer10/12: app always follows pool write with setpoint (like Koelen).
+  - id: write_pool_zwembad
+    then:
+      - lambda: |-
+          if (id(setpoint_temperature).has_state()) {
+            id(pending_setpoint) = id(setpoint_temperature).state;
+          }
+      - script.execute: write_select_settings_group3
+      - logger.log:
+          level: INFO
+          format: "Dura-H17i BLE WRITE Pool Zwembad enum1+setpoint hex=0a1a08080310021a02280100 ble=%s"
+          args: ['id(ble_connected).state ? "connected" : "DISCONNECTED"']
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: [0x0A, 0x1A, 0x08, 0x08, 0x03, 0x10, 0x02, 0x1A, 0x02, 0x28, 0x01, 0x00]
+      - delay: 300ms
+      - script.execute: write_setpoint
+
+  - id: write_pool_spa
+    then:
+      - lambda: |-
+          if (id(setpoint_temperature).has_state()) {
+            id(pending_setpoint) = id(setpoint_temperature).state;
+          }
+      - script.execute: write_select_settings_group3
+      - logger.log:
+          level: INFO
+          format: "Dura-H17i BLE WRITE Pool Spa enum1+setpoint hex=0b1a08080310021a02280100 ble=%s"
+          args: ['id(ble_connected).state ? "connected" : "DISCONNECTED"']
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: [0x0B, 0x1A, 0x08, 0x08, 0x03, 0x10, 0x02, 0x1A, 0x02, 0x28, 0x01, 0x00]
+      - delay: 300ms
+      - script.execute: write_setpoint
+
+  # Settings group 3 (id=5 Pump). sniffer25–27:
+  #   Op verzoek=enum2, Interval=enum3; AAN=enum1×2; UIT=enum1×1 (same bytes, 1× vs 2×).
+  #   Schema: GlobalOff=0 / GlobalOn=1 / OnRequest=2 / OnInterval=3 — app never writes enum0.
+  - id: write_pump_uit
+    then:
+      - script.execute: write_select_settings_group3
+      - logger.log:
+          level: INFO
+          format: "Dura-H17i BLE WRITE Pump UIT enum1×1 hex=0a1a08080310051a02280100 ble=%s"
+          args: ['id(ble_connected).state ? "connected" : "DISCONNECTED"']
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: [0x0A, 0x1A, 0x08, 0x08, 0x03, 0x10, 0x05, 0x1A, 0x02, 0x28, 0x01, 0x00]
+
+  - id: write_pump_aan
+    then:
+      - script.execute: write_select_settings_group3
+      - logger.log:
+          level: INFO
+          format: "Dura-H17i BLE WRITE Pump AAN enum1×2 hex=0b1a08080310051a02280100 ble=%s"
+          args: ['id(ble_connected).state ? "connected" : "DISCONNECTED"']
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: [0x0B, 0x1A, 0x08, 0x08, 0x03, 0x10, 0x05, 0x1A, 0x02, 0x28, 0x01, 0x00]
+      - delay: 300ms
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: [0x0B, 0x1A, 0x08, 0x08, 0x03, 0x10, 0x05, 0x1A, 0x02, 0x28, 0x01, 0x00]
+
+  - id: write_pump_op_verzoek
+    then:
+      - script.execute: write_select_settings_group3
+      - logger.log:
+          level: INFO
+          format: "Dura-H17i BLE WRITE Pump Op verzoek hex=0b1a08080310051a02280200 ble=%s"
+          args: ['id(ble_connected).state ? "connected" : "DISCONNECTED"']
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: [0x0B, 0x1A, 0x08, 0x08, 0x03, 0x10, 0x05, 0x1A, 0x02, 0x28, 0x02, 0x00]
+
+  - id: write_pump_interval
+    then:
+      - script.execute: write_select_settings_group3
+      - logger.log:
+          level: INFO
+          format: "Dura-H17i BLE WRITE Pump Interval hex=0b1a08080310051a02280300 ble=%s"
+          args: ['id(ble_connected).state ? "connected" : "DISCONNECTED"']
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: [0x0B, 0x1A, 0x08, 0x08, 0x03, 0x10, 0x05, 0x1A, 0x02, 0x28, 0x03, 0x00]
+
+  # Settings group 3 int (sniffer8): id=6 Interval, id=7 Check, id=8 OneTouch brightness
+  # Uses dura::encode_varint (present on live header). Same wire as make_settings_int_command.
+  - id: write_interval_minutes
+    then:
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: !lambda |-
+            std::vector<uint8_t> varint;
+            dura::encode_varint(id(pending_interval_min), varint);
+            std::vector<uint8_t> value_msg = {0x10};
+            value_msg.insert(value_msg.end(), varint.begin(), varint.end());
+            std::vector<uint8_t> inner = {0x08, 0x03, 0x10, 0x06, 0x1a};
+            inner.push_back(static_cast<uint8_t>(value_msg.size()));
+            inner.insert(inner.end(), value_msg.begin(), value_msg.end());
+            std::vector<uint8_t> cmd;
+            cmd.push_back(static_cast<uint8_t>(inner.size() + 3));
+            cmd.push_back(0x1a);
+            cmd.push_back(static_cast<uint8_t>(inner.size()));
+            cmd.insert(cmd.end(), inner.begin(), inner.end());
+            cmd.push_back(0x00);
+            return cmd;
+
+  - id: write_check_minutes
+    then:
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: !lambda |-
+            std::vector<uint8_t> varint;
+            dura::encode_varint(id(pending_check_min), varint);
+            std::vector<uint8_t> value_msg = {0x10};
+            value_msg.insert(value_msg.end(), varint.begin(), varint.end());
+            std::vector<uint8_t> inner = {0x08, 0x03, 0x10, 0x07, 0x1a};
+            inner.push_back(static_cast<uint8_t>(value_msg.size()));
+            inner.insert(inner.end(), value_msg.begin(), value_msg.end());
+            std::vector<uint8_t> cmd;
+            cmd.push_back(static_cast<uint8_t>(inner.size() + 3));
+            cmd.push_back(0x1a);
+            cmd.push_back(static_cast<uint8_t>(inner.size()));
+            cmd.insert(cmd.end(), inner.begin(), inner.end());
+            cmd.push_back(0x00);
+            return cmd;
+
+  - id: write_onetouch_brightness
+    then:
+      - ble_client.ble_write:
+          id: dura_ble
+          service_uuid: ${svc_cmd}
+          characteristic_uuid: ${chr_write}
+          value: !lambda |-
+            std::vector<uint8_t> varint;
+            dura::encode_varint(id(pending_onetouch_brightness), varint);
+            std::vector<uint8_t> value_msg = {0x10};
+            value_msg.insert(value_msg.end(), varint.begin(), varint.end());
+            std::vector<uint8_t> inner = {0x08, 0x03, 0x10, 0x08, 0x1a};
+            inner.push_back(static_cast<uint8_t>(value_msg.size()));
+            inner.insert(inner.end(), value_msg.begin(), value_msg.end());
+            std::vector<uint8_t> cmd;
+            cmd.push_back(static_cast<uint8_t>(inner.size() + 3));
+            cmd.push_back(0x1a);
+            cmd.push_back(static_cast<uint8_t>(inner.size()));
+            cmd.insert(cmd.end(), inner.begin(), inner.end());
+            cmd.push_back(0x00);
+            return cmd;
+
+binary_sensor:
+  - platform: template
+    name: "BLE verbonden"
+    id: ble_connected
+    device_class: connectivity
+
+  - platform: template
+    name: "Warmtepomp aan"
+    id: heatpump_power
+
+  - platform: template
+    name: "Verwarmt"
+    id: heating_active
+
+  - platform: template
+    name: "E03 Geen stroming"
+    id: e03_no_flow
+    device_class: problem
+
+sensor:
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: dura_ble
+    internal: true
+    id: dura_notify_sink
+    service_uuid: ${svc_cmd}
+    characteristic_uuid: ${chr_notify}
+    notify: true
+    lambda: |-
+      const auto &data = x;
+      if (data.empty()) {
+        return 0.0f;
+      }
+
+      if (!id(handshake_sent)) {
+        id(handshake_sent) = true;
+        ESP_LOGI("dura_h17i", "NOTIFY len=%u water=%d ambient=%d out=%d setpoint=%d",
+                 (unsigned) data.size(),
+                 dura::contains(data, "hiWaterTemperature") ? 1 : 0,
+                 dura::contains(data, "hiAmbientTemperature") ? 1 : 0,
+                 dura::contains(data, "hiWaterOutTemperature") ? 1 : 0,
+                 dura::contains(data, "hiSetpoint") ? 1 : 0);
+      }
+
+      id(ble_connected).publish_state(true);
+      id(last_notify_ms) = millis();
+
+      // Strict typed temps only (no untyped fallback): within the water-field
+      // window the setpoint (type 6) also appears — a loose parse published SP as inlet.
+      bool got_telemetry = false;
+      int raw = 0;
+      if (dura::find_nested_varint(data, "hiWaterTemperature", raw, 50, 500, 0x03)) {
+        id(water_temperature).publish_state(raw / 10.0f);
+        got_telemetry = true;
+      }
+      if (dura::find_nested_varint(data, "hiAmbientTemperature", raw, 50, 500, 0x02)) {
+        id(ambient_temperature).publish_state(raw / 10.0f);
+        ESP_LOGI("dura_h17i", "Ambient=%.1fC", raw / 10.0f);
+      }
+      if (dura::find_nested_varint(data, "hiWaterOutTemperature", raw, 50, 500, 0x02)) {
+        id(water_out_temperature).publish_state(raw / 10.0f);
+        ESP_LOGI("dura_h17i", "Outlet=%.1fC", raw / 10.0f);
+        got_telemetry = true;
+      }
+      if (dura::find_nested_varint(data, "hiSetpoint", raw, 50, 500, 0x06)) {
+        id(setpoint_temperature).publish_state(raw / 10.0f);
+      }
+
+      int watts = 0;
+      if (dura::find_power_watts(data, watts)) {
+        id(power_input).publish_state(watts);
+        got_telemetry = true;
+      }
+      if (got_telemetry) {
+        id(last_telemetry_ms) = millis();
+      }
+
+      // Strikt 08 06 12 02 28 (niet dura::find_noise_mode fallback — die botst met pump 08 05)
+      const char *mode = nullptr;
+      for (size_t i = 0; i + 6 <= data.size(); i++) {
+        if (data[i] == 0x08 && data[i + 1] == 0x06 && data[i + 2] == 0x12 &&
+            data[i + 3] == 0x02 && data[i + 4] == 0x28) {
+          mode = dura::mode_from_byte(data[i + 5]);
+          if (mode != nullptr) {
+            break;
+          }
+        }
+      }
+      if (mode != nullptr) {
+        id(noise_mode).publish_state(mode);
+        id(mode_select).publish_state(mode);
+      }
+
+      if (dura::contains(data, "hiIdleStateNoFLow") && data.size() < 200) {
+        id(e03_no_flow).publish_state(true);
+      } else if (dura::contains(data, "hiHeatpumpStateHeating") ||
+                 dura::contains(data, "hiHeatpumpStateIdle") ||
+                 dura::contains(data, "hiHeatpumpStateOff")) {
+        id(e03_no_flow).publish_state(false);
+      }
+
+      bool pwr_on = false;
+      const bool pwr_known = dura::find_power_on(data, pwr_on);
+      if (pwr_known) {
+        id(heatpump_power).publish_state(pwr_on);
+      }
+
+      // Verwarmt: schema-pakketten bevatten alle state-namen als ASCII — niet op
+      // contains vertrouwen zonder power aan. Guard aan het eind wist stale state.
+      const bool pump_on = id(heatpump_power).has_state() && id(heatpump_power).state;
+      if (pump_on && dura::contains(data, "hiHeatpumpStateHeating")) {
+        id(heating_active).publish_state(true);
+      } else if (dura::contains(data, "hiHeatpumpStateCooling") ||
+                 dura::contains(data, "hiHeatpumpStateIdle") ||
+                 dura::contains(data, "hiHeatpumpStateOff")) {
+        id(heating_active).publish_state(false);
+      }
+      if (id(heatpump_power).has_state() && !id(heatpump_power).state) {
+        id(heating_active).publish_state(false);
+      }
+
+      return 0.0f;
+
+  - platform: template
+    name: "Inlaattemperatuur"
+    id: water_temperature
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    filters:
+      - heartbeat: 2s
+
+  - platform: template
+    name: "Omgevingstemperatuur"
+    id: ambient_temperature
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    filters:
+      - heartbeat: 2s
+
+  - platform: template
+    name: "Uitlaattemperatuur"
+    id: water_out_temperature
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    filters:
+      - heartbeat: 2s
+
+  - platform: template
+    name: "Setpoint"
+    id: setpoint_temperature
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+    filters:
+      - heartbeat: 2s
+
+  - platform: template
+    name: "Vermogen"
+    id: power_input
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    filters:
+      - heartbeat: 2s
+
+  # Seconden sinds laatste notify mét inlaat/uitlaat/vermogen (diagnostiek)
+  - platform: template
+    name: "BLE data leeftijd"
+    id: ble_telemetry_age
+    unit_of_measurement: "s"
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      if (id(last_telemetry_ms) == 0) {
+        return NAN;
+      }
+      return (millis() - id(last_telemetry_ms)) / 1000.0f;
+
+text_sensor:
+  # Intern: zelfde info als select "Modus" — niet nodig in HA
+  - platform: template
+    id: noise_mode
+    internal: true
+  # Optimistic (geen notify-parser voor settings group3 nog)
+  - platform: template
+    id: unit_mode
+    internal: true
+  - platform: template
+    id: pool_type
+    internal: true
+  - platform: template
+    id: pump_mode
+    internal: true
+
+switch:
+  # Uit = BLE loslaten zodat DURACLOUD/sniffer kan verbinden (WiFi/API blijft aan)
+  - platform: template
+    name: "BLE bridge"
+    id: ble_bridge_enabled
+    icon: mdi:bluetooth-connect
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - logger.log:
+          level: INFO
+          format: "Dura-H17i: BLE bridge AAN"
+      - script.execute: ble_connect_cycle
+    turn_off_action:
+      - logger.log:
+          level: INFO
+          format: "Dura-H17i: BLE bridge UIT (sniff-modus)"
+      - script.stop: ble_handshake_burst
+      - script.stop: ble_subscribe_state
+      - script.stop: ble_refresh_telemetry
+      - ble_client.disconnect: dura_ble
+
+  - platform: template
+    name: "Warmtepomp"
+    id: heatpump_switch
+    optimistic: false
+    lambda: |-
+      return id(heatpump_power).has_state() && id(heatpump_power).state;
+    turn_on_action:
+      - script.execute: write_power_on
+    turn_off_action:
+      - lambda: |-
+          id(heating_active).publish_state(false);
+      - script.execute: write_power_off
+
+select:
+  - platform: template
+    name: "Modus"
+    id: mode_select
+    # ESPHome forbids optimistic+lambda; publish select state explicitly (voorkomt HA snapback)
+    options:
+      - "Stille"
+      - "Standaard"
+      - "Boost"
+      - "Slim"
+    lambda: |-
+      if (id(noise_mode).state.empty()) {
+        return std::string("Standaard");
+      }
+      return id(noise_mode).state;
+    set_action:
+      - lambda: |-
+          id(noise_mode).publish_state(x);
+          id(mode_select).publish_state(x);
+      - if:
+          condition:
+            lambda: 'return x == "Standaard";'
+          then:
+            - script.execute: write_mode_standaard
+      - if:
+          condition:
+            lambda: 'return x == "Boost";'
+          then:
+            - script.execute: write_mode_boost
+      - if:
+          condition:
+            lambda: 'return x == "Slim";'
+          then:
+            - script.execute: write_mode_slim
+      - if:
+          condition:
+            lambda: 'return x == "Stille";'
+          then:
+            - script.execute: write_mode_stille
+
+  # UnitMode: Verwarmen=1 (sniff/live OK), Koelen=0 (synth/unknown), Automatisch=2 (live OK)
+  # set_action: publish_state (HA UI) + script → ble_client.ble_write (same path Auto uses)
+  - platform: template
+    name: "Unit modus"
+    id: unit_mode_select
+    icon: mdi:heat-pump
+    # Geen notify-parser voor group3; publish_state voorkomt HA snapback (geen optimistic+lambda)
+    options:
+      - "Verwarmen"
+      - "Koelen"
+      - "Automatisch"
+    lambda: |-
+      if (id(unit_mode).state.empty()) {
+        return std::string("Verwarmen");
+      }
+      return id(unit_mode).state;
+    set_action:
+      - logger.log:
+          level: INFO
+          format: "Dura-H17i: Unit modus set_action -> %s (HA publish + BLE write script)"
+          args: [x.c_str()]
+      - lambda: |-
+          id(unit_mode).publish_state(x);
+          id(unit_mode_select).publish_state(x);
+      - if:
+          condition:
+            lambda: 'return x == "Verwarmen";'
+          then:
+            - script.execute: write_unit_verwarmen
+      - if:
+          condition:
+            lambda: 'return x == "Koelen";'
+          then:
+            - script.execute: write_unit_koelen
+      - if:
+          condition:
+            lambda: 'return x == "Automatisch";'
+          then:
+            - script.execute: write_unit_auto
+
+  # PoolType: toggle via enum1 …2801 + setpoint (sniffer8/10); notify 2801=Spa, 2819=Zwembad
+  - platform: template
+    name: "Pooltype"
+    id: pool_type_select
+    icon: mdi:pool
+    options:
+      - "Zwembad"
+      - "Spa"
+    lambda: |-
+      if (id(pool_type).state.empty()) {
+        return std::string("Zwembad");
+      }
+      return id(pool_type).state;
+    set_action:
+      - logger.log:
+          level: INFO
+          format: "Dura-H17i: Pooltype set_action -> %s (HA publish + BLE write script)"
+          args: [x.c_str()]
+      - lambda: |-
+          id(pool_type).publish_state(x);
+          id(pool_type_select).publish_state(x);
+      - if:
+          condition:
+            lambda: 'return x == "Zwembad";'
+          then:
+            - script.execute: write_pool_zwembad
+      - if:
+          condition:
+            lambda: 'return x == "Spa";'
+          then:
+            - script.execute: write_pool_spa
+
+  # Circulatiepomp: UIT=enum1×1, AAN=enum1×2, Op verzoek=2, Interval=3 (sniffer25–27)
+  - platform: template
+    name: "Circulatiepomp"
+    id: pump_mode_select
+    icon: mdi:pump
+    options:
+      - "UIT"
+      - "AAN"
+      - "Op verzoek"
+      - "Interval"
+    lambda: |-
+      if (id(pump_mode).state.empty()) {
+        return std::string("AAN");
+      }
+      return id(pump_mode).state;
+    set_action:
+      - logger.log:
+          level: INFO
+          format: "Dura-H17i: Circulatiepomp set_action -> %s (HA publish + BLE write script)"
+          args: [x.c_str()]
+      - lambda: |-
+          id(pump_mode).publish_state(x);
+          id(pump_mode_select).publish_state(x);
+      - if:
+          condition:
+            lambda: 'return x == "UIT";'
+          then:
+            - script.execute: write_pump_uit
+      - if:
+          condition:
+            lambda: 'return x == "AAN";'
+          then:
+            - script.execute: write_pump_aan
+      - if:
+          condition:
+            lambda: 'return x == "Op verzoek";'
+          then:
+            - script.execute: write_pump_op_verzoek
+      - if:
+          condition:
+            lambda: 'return x == "Interval";'
+          then:
+            - script.execute: write_pump_interval
+
+number:
+  - platform: template
+    name: "Gewenste temperatuur"
+    id: target_temperature
+    min_value: 15
+    max_value: 35
+    step: 0.5
+    unit_of_measurement: "°C"
+    mode: box
+    lambda: |-
+      if (id(setpoint_temperature).has_state()) {
+        return id(setpoint_temperature).state;
+      }
+      return id(pending_setpoint);
+    set_action:
+      - lambda: |-
+          id(pending_setpoint) = x;
+      - script.execute: write_setpoint
+
+  # Optimistic (geen notify-parser voor settings group3 int)
+  - platform: template
+    name: "Interval tijd"
+    id: interval_minutes
+    icon: mdi:timer-outline
+    min_value: 5
+    max_value: 180
+    step: 1
+    unit_of_measurement: "min"
+    mode: box
+    optimistic: true
+    initial_value: 70
+    set_action:
+      - lambda: |-
+          id(pending_interval_min) = static_cast<int>(x);
+      - script.execute: write_interval_minutes
+
+  - platform: template
+    name: "Controle tijd"
+    id: check_minutes
+    icon: mdi:timer-sand
+    min_value: 1
+    max_value: 60
+    step: 1
+    unit_of_measurement: "min"
+    mode: box
+    optimistic: true
+    initial_value: 5
+    set_action:
+      - lambda: |-
+          id(pending_check_min) = static_cast<int>(x);
+      - script.execute: write_check_minutes
+
+  # Range uncertain (sniffer8 sample=4 only); 1–10 is a starting guess
+  - platform: template
+    name: "OneTouch helderheid"
+    id: onetouch_brightness
+    icon: mdi:brightness-6
+    min_value: 1
+    max_value: 10
+    step: 1
+    mode: box
+    optimistic: true
+    initial_value: 4
+    set_action:
+      - lambda: |-
+          id(pending_onetouch_brightness) = static_cast<int>(x);
+      - script.execute: write_onetouch_brightness
+
+button:
+  - platform: template
+    name: "BLE herverbinden"
+    on_press:
+      - if:
+          condition:
+            switch.is_on: ble_bridge_enabled
+          then:
+            - script.execute: ble_connect_cycle
+
+interval:
+  # Na dashboard-notify: ambient/uitlaat + state (één keer per sessie)
+  - interval: 3s
+    then:
+      - if:
+          condition:
+            and:
+              - switch.is_on: ble_bridge_enabled
+              - binary_sensor.is_on: ble_connected
+          then:
+            - if:
+                condition:
+                  lambda: 'return id(handshake_sent) && !id(state_subscribed);'
+                then:
+                  - script.execute: ble_subscribe_state
+  # Stale BLE: "verbonden" maar geen notify-pakketten >45s → herconnect
+  # Heartbeats (~1 Hz, zonder W/°C) houden last_notify_ms vers — daarnaast
+  # telemetry-watchdog: geen inlaat/vermogen >45s → refresh; >90s → herconnect.
+  # Cooldown 90s voorkomt reconnect-storm (BLE van de pomp niet belasten).
+  - interval: 15s
+    then:
+      - if:
+          condition:
+            and:
+              - switch.is_on: ble_bridge_enabled
+              - binary_sensor.is_on: ble_connected
+          then:
+            - if:
+                condition:
+                  lambda: |-
+                    const uint32_t now = millis();
+                    if (id(last_telemetry_ms) == 0) {
+                      return false;
+                    }
+                    const uint32_t age = now - id(last_telemetry_ms);
+                    if (age <= 45000) {
+                      return false;
+                    }
+                    // Eerst lichte refresh (niet full reconnect)
+                    if (age <= 90000) {
+                      if (id(last_telemetry_refresh_ms) != 0 &&
+                          (now - id(last_telemetry_refresh_ms)) < 30000) {
+                        return false;
+                      }
+                      return true;
+                    }
+                    return false;
+                then:
+                  - script.execute: ble_refresh_telemetry
+            - if:
+                condition:
+                  lambda: |-
+                    const uint32_t now = millis();
+                    if (id(last_notify_ms) == 0 && id(last_telemetry_ms) == 0) {
+                      return false;
+                    }
+                    const bool no_notify =
+                        id(last_notify_ms) != 0 && (now - id(last_notify_ms)) > 45000;
+                    const bool no_telemetry =
+                        id(last_telemetry_ms) != 0 && (now - id(last_telemetry_ms)) > 90000;
+                    if (!no_notify && !no_telemetry) {
+                      return false;
+                    }
+                    if (id(last_watchdog_reconnect_ms) != 0 &&
+                        (now - id(last_watchdog_reconnect_ms)) < 90000) {
+                      return false;
+                    }
+                    return true;
+                then:
+                  - logger.log:
+                      level: WARN
+                      format: "Dura-H17i: geen verse BLE-data — herverbinden (watchdog)"
+                  - lambda: |-
+                      id(last_watchdog_reconnect_ms) = millis();
+                      id(ble_connected).publish_state(false);
+                      id(handshake_sent) = false;
+                      id(state_subscribed) = false;
+                      id(last_notify_ms) = 0;
+                      id(last_telemetry_ms) = 0;
+                  - script.execute: ble_connect_cycle
+  - interval: 180s
+    then:
+      - if:
+          condition:
+            and:
+              - switch.is_on: ble_bridge_enabled
+              - binary_sensor.is_off: ble_connected
+          then:
+            - script.execute: ble_connect_cycle

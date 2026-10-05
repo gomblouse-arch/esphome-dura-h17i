@@ -1,0 +1,116 @@
+# Climate-kaart via custom component climate_template
+# HACS: jcwillox/hass-template-climate
+# Na installatie: HA herstarten.
+#
+# Deploy: kopieer naar HA `config/packages/dura_h17i_climate.yaml`
+# (zie FLASHEREN.md). Entity IDs volgen device-prefix Zwembad warmtepomp Dura-H17i.
+#
+# Unit-modus (sniffer8): Koelen=enum1 0b…2801+setpoint; Verwarmen=enum1 0a…2801×2; Auto=…2802
+
+climate:
+  - platform: climate_template
+    name: "Zwembad warmtepomp"
+    unique_id: zwembad_warmtepomp_climate
+    icon: mdi:pool-thermometer
+    modes:
+      - "off"
+      - heat
+      - cool
+      - auto
+    min_temp: 15
+    max_temp: 35
+    temp_step: 0.5
+    precision: 0.1
+    preset_modes:
+      - "Stille"
+      - "Standaard"
+      - "Boost"
+      - "Slim"
+    current_temperature_template: >-
+      {{ states('sensor.zwembad_warmtepomp_dura_h17i_inlaattemperatuur') | float(0) }}
+    target_temperature_template: >-
+      {{ states('number.zwembad_warmtepomp_dura_h17i_gewenste_temperatuur') | float(28) }}
+    hvac_mode_template: >-
+      {% if is_state('switch.zwembad_warmtepomp_dura_h17i_warmtepomp', 'off') %}
+        off
+      {% else %}
+        {% set u = states('select.zwembad_warmtepomp_dura_h17i_unit_modus') %}
+        {% if u == 'Koelen' %}
+          cool
+        {% elif u == 'Automatisch' %}
+          auto
+        {% else %}
+          heat
+        {% endif %}
+      {% endif %}
+    hvac_action_template: >-
+      {% if is_state('switch.zwembad_warmtepomp_dura_h17i_warmtepomp', 'off') %}
+        off
+      {% elif is_state('select.zwembad_warmtepomp_dura_h17i_unit_modus', 'Koelen') %}
+        cooling
+      {% elif is_state('binary_sensor.zwembad_warmtepomp_dura_h17i_verwarmt', 'on') %}
+        heating
+      {% else %}
+        idle
+      {% endif %}
+    preset_mode_template: >-
+      {% set m = states('select.zwembad_warmtepomp_dura_h17i_modus') %}
+      {{ m if m in ['Stille', 'Standaard', 'Boost', 'Slim'] else 'Standaard' }}
+    availability_template: "{{ is_state('binary_sensor.zwembad_warmtepomp_dura_h17i_ble_verbonden', 'on') }}"
+    set_temperature:
+      - action: number.set_value
+        target:
+          entity_id: number.zwembad_warmtepomp_dura_h17i_gewenste_temperatuur
+        data:
+          value: "{{ temperature }}"
+    set_hvac_mode:
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ hvac_mode == 'off' }}"
+            sequence:
+              - action: switch.turn_off
+                target:
+                  entity_id: switch.zwembad_warmtepomp_dura_h17i_warmtepomp
+          - conditions:
+              - condition: template
+                value_template: "{{ hvac_mode == 'heat' }}"
+            sequence:
+              - action: switch.turn_on
+                target:
+                  entity_id: switch.zwembad_warmtepomp_dura_h17i_warmtepomp
+              - action: select.select_option
+                target:
+                  entity_id: select.zwembad_warmtepomp_dura_h17i_unit_modus
+                data:
+                  option: Verwarmen
+          - conditions:
+              - condition: template
+                value_template: "{{ hvac_mode == 'cool' }}"
+            sequence:
+              - action: switch.turn_on
+                target:
+                  entity_id: switch.zwembad_warmtepomp_dura_h17i_warmtepomp
+              - action: select.select_option
+                target:
+                  entity_id: select.zwembad_warmtepomp_dura_h17i_unit_modus
+                data:
+                  option: Koelen
+          - conditions:
+              - condition: template
+                value_template: "{{ hvac_mode == 'auto' }}"
+            sequence:
+              - action: switch.turn_on
+                target:
+                  entity_id: switch.zwembad_warmtepomp_dura_h17i_warmtepomp
+              - action: select.select_option
+                target:
+                  entity_id: select.zwembad_warmtepomp_dura_h17i_unit_modus
+                data:
+                  option: Automatisch
+    set_preset_mode:
+      - action: select.select_option
+        target:
+          entity_id: select.zwembad_warmtepomp_dura_h17i_modus
+        data:
+          option: "{{ preset_mode }}"

@@ -1,0 +1,62 @@
+# Alleen gebruiken na installatie van climate_template in custom_components/
+# https://github.com/jcwillox/hass-template-climate
+#
+# Kopieer naar packages/dura_h17i_climate.yaml en herstart Home Assistant.
+
+climate:
+  - platform: climate_template
+    name: "Zwembad warmtepomp"
+    unique_id: zwembad_warmtepomp_climate
+    icon: mdi:pool-thermometer
+    modes:
+      - "off"
+      - heat
+    min_temp: 15
+    max_temp: 35
+    target_temp_step: 0.5
+    precision: 0.1
+    temperature_unit: C
+    preset_modes:
+      - "Stille"
+      - "Standaard"
+      - "Boost"
+      - "Slim"
+    current_temperature_template: >-
+      {{ states('sensor.zwembad_warmtepomp_dura_h17i_zwembad_watertemperatuur') | float(0) }}
+    target_temperature_template: >-
+      {{ states('number.zwembad_warmtepomp_dura_h17i_gewenste_temperatuur') | float(28) }}
+    hvac_mode_template: >-
+      {% if is_state('switch.zwembad_warmtepomp_dura_h17i_warmtepomp', 'on') %}
+        heat
+      {% else %}
+        off
+      {% endif %}
+    preset_mode_template: "{{ states('select.zwembad_warmtepomp_dura_h17i_modus') }}"
+    set_temperature:
+      - service: number.set_value
+        target:
+          entity_id: number.zwembad_warmtepomp_dura_h17i_gewenste_temperatuur
+        data:
+          value: "{{ temperature }}"
+    set_hvac_mode:
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ hvac_mode == 'heat' }}"
+            sequence:
+              - service: switch.turn_on
+                target:
+                  entity_id: switch.zwembad_warmtepomp_dura_h17i_warmtepomp
+          - conditions:
+              - condition: template
+                value_template: "{{ hvac_mode == 'off' }}"
+            sequence:
+              - service: switch.turn_off
+                target:
+                  entity_id: switch.zwembad_warmtepomp_dura_h17i_warmtepomp
+    set_preset_mode:
+      - service: select.select_option
+        target:
+          entity_id: select.zwembad_warmtepomp_dura_h17i_modus
+        data:
+          option: "{{ preset_mode }}"
